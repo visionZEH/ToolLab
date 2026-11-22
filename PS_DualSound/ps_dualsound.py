@@ -3,16 +3,20 @@ PS_DualSound（音频引擎 + 命令行版）
 
 日常使用请运行托盘版 ps_dualsound_tray.pyw；本文件也可以单独在命令行里用。
 
-DualSense 通过 USB 连接时是一个 4 声道声卡：
+有线：DualSense 通过 USB 连接时是一个 4 声道声卡：
     声道 1/2 -> 手柄耳机孔
     声道 3/4 -> 左/右 音频震动马达 (haptics)
 
-用法：Windows 默认输出设为 DualSense，然后：
+有线用法：Windows 默认输出设为 DualSense，然后：
   1. 选择声音输出设备（音箱）
   2. 选择震动强度
        0 原生     只保留游戏原生震动（细腻）
-       1~4 增强   在原生震动之上，再叠加由游戏声音低频生成的震动（更猛）
+       1 仿原生   叠加一层很轻的低频震动；蓝牙下用来模拟有线的原生震感
+       2~5 增强   在原生震动之上，再叠加由游戏声音低频生成的震动（更猛）
   游戏声音（声道1/2）实时转发到音箱；增强震动只写声道 3/4，不会形成回环。
+
+蓝牙：不用改默认输出。录下 Windows 默认输出正在播放的声音，把低频作为震动直接发给手柄。
+      游戏原生的 3/4 声道震动只有有线时才有。
 
 命令行：
     python ps_dualsound.py --out Realtek --level 3
@@ -37,6 +41,8 @@ os.environ["OMP_NUM_THREADS"] = "1"
 
 import numpy as np
 import soundcard as sc
+
+import dualsense_bt as bt
 
 warnings.filterwarnings("ignore", category=sc.SoundcardRuntimeWarning)
 
@@ -63,8 +69,9 @@ SETTINGS = Path(__file__).with_name("settings.json")
 
 # 强度档位: (名称, 强度倍数, 增强指数, 低通截止 Hz)
 LEVELS = [
-    ("原生（细腻）", 0, 1.0, 0),
-    ("轻度增强", 1.0, 0.8, 150),
+    ("原生（不增强）", 0, 1.0, 0),
+    ("仿原生（细腻）", 0.8, 0.8, 150),
+    ("轻微增强", 1.0, 0.8, 150),
     ("中度增强", 2.0, 0.6, 120),
     ("强", 3.0, 0.5, 100),
     ("超强", 5.0, 0.4, 90),
@@ -86,9 +93,14 @@ def claim_single_instance():
 
 def load_settings():
     try:
-        return dict(json.loads(SETTINGS.read_text(encoding="utf-8")))
+        data = dict(json.loads(SETTINGS.read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError):
-        return {}
+        return {"version": 2}
+    if "version" not in data:  # 旧版没有「仿原生」，原来的 1~4 档现在是 2~5 档
+        if data.get("level") in (1, 2, 3, 4):
+            data["level"] += 1
+        data["version"] = 2
+    return data
 
 
 def save_settings(**changes):
@@ -147,7 +159,8 @@ class LowPass:
     先逐点模拟一次单位响应，之后每块只做一次卷积和两次矩阵乘法，结果和逐点滤波一致。
     """
 
-    def __init__(self, cutoff, channels=2):
+    def __init__(self, cutoff, channels=2, block=BLOCK):
+        self.block = block
         w = 2 * math.pi * cutoff / RATE
         sections = []
         for q in (1 / (2 * math.cos(math.pi / 8)), 1 / (2 * math.cos(3 * math.pi / 8))):
@@ -157,7 +170,7 @@ class LowPass:
 
         def simulate(state, impulse):
             s, out, track = list(state), [], []
-            for n in range(BLOCK):
+            for n in range(block):
                 x = impulse if n == 0 else 0.0
                 for i, (b0, b1, b2, a1, a2) in enumerate(sections):
                     y = b0 * x + s[2 * i]
@@ -178,7 +191,7 @@ class LowPass:
     def __call__(self, x):
         y = self.state_to_out @ self.state
         for ch in range(x.shape[1]):
-            y[:, ch] += np.convolve(x[:, ch], self.h)[:BLOCK]
+            y[:, ch] += np.convolve(x[:, ch], self.h)[:self.block]
         self.state = self.state_to_state @ self.state + self.input_to_state @ x.astype(np.float64)
         self.state[np.abs(self.state) < 1e-20] = 0.0  # 静音时避免极小数拖慢 CPU
         return y
@@ -215,6 +228,54 @@ def run(ds, out, level, gain, stop=lambda: False, started=lambda: None):
                 hap.play(buf)
 
 
+def run_bluetooth(path, level, stop=lambda: False, started=lambda name: None):
+    """把默认输出里的低频发给蓝牙手柄；默认输出变了或插上了 USB 时返回，由调用方重新选择。"""
+    _, strength, curve, cutoff = LEVELS[level]
+    src = sc.default_speaker()
+    lowpass = LowPass(cutoff, block=bt.BLOCK)
+    mic = sc.get_microphone(src.id, include_loopback=True)
+    with bt.Controller(path) as pad, \
+         mic.recorder(samplerate=RATE, channels=2, blocksize=BLOCK) as rec:
+        pad.gate = round(bt.OVERRIDE_PEAK * min(strength, 1))  # 震动调轻时门槛同比降低，否则轻的声音会消失
+        started(device_name(src))
+        pending = np.zeros((0, 2), dtype=np.float32)
+        heard = checked = time.perf_counter()
+        try:
+            while not stop():
+                now = time.perf_counter()
+                if now - checked >= 2:
+                    checked = now
+                    if sc.default_speaker().id != src.id or bt.find() != path or list_devices()[0]:
+                        return
+                # 没声音时 record() 会每 0.75 ms 轮询一次，所以先自己查一下有没有数据
+                if rec._capture_available_frames():
+                    pending = np.concatenate((pending, rec.record(numframes=None)))
+                    heard = now
+                    if len(pending) > bt.BLOCK * 8:  # 系统卡顿后丢掉积压，避免延迟越来越大
+                        pending = pending[-bt.BLOCK * 2:]
+                    while len(pending) >= bt.BLOCK:
+                        game, pending = pending[:bt.BLOCK], pending[bt.BLOCK:]
+                        haptic = shape_haptic(lowpass(game), strength, curve)
+                        if np.abs(game).max() < 1e-4:  # 别把声卡底噪放大成震动
+                            haptic[:] = 0
+                        pad.send(bt.to_packet(haptic))
+                elif now - heard < 0.05:
+                    time.sleep(0.003)
+                elif pad.silent < bt.SILENT_TAIL:  # 声音停了：补一小段静音让马达停下
+                    pending = pending[:0]
+                    lowpass.state[:] = 0
+                    pad.send(bytes(bt.FRAMES * 2))
+                    time.sleep(bt.BLOCK / RATE)
+                else:
+                    time.sleep(0.01)
+        finally:
+            try:
+                if pad.silent < bt.SILENT_TAIL:
+                    pad.stop()
+            except OSError:  # 手柄已经断开
+                pass
+
+
 def ask(prompt, n, last):
     hint = f"（回车 = 上次的 {last}）" if last is not None and 0 <= last < n else ""
     while True:
@@ -228,9 +289,9 @@ def ask(prompt, n, last):
 
 def main():
     p = argparse.ArgumentParser(description="PS_DualSound")
-    p.add_argument("--out", help="声音输出设备（名字关键字），不填则弹出菜单")
+    p.add_argument("--out", help="有线时的声音输出设备（名字关键字），不填则弹出菜单")
     p.add_argument("--level", type=int, choices=range(len(LEVELS)),
-                   help="震动强度 0~4，不填则弹出菜单")
+                   help="震动强度 0~5，不填则弹出菜单")
     p.add_argument("--gain", type=float, default=1.0, help="音箱音量倍数（默认 1）")
     p.add_argument("--list", action="store_true", help="列出输出设备")
     a = p.parse_args()
@@ -247,43 +308,58 @@ def main():
 
     try:
         ds, outs = list_devices()
-        if not ds:
-            sys.exit("没找到 DualSense 音频设备，请确认手柄是 USB 有线连接。")
+        if not ds and not bt.find():
+            sys.exit("没找到 DualSense，请用 USB 连接，或者先在 Windows 蓝牙里配对。")
         st = load_settings()
+        out_name = st.get("out")
         if a.out:
             out = next((s for s in outs if a.out.lower() in device_name(s).lower()), None)
             if not out:
                 sys.exit(f"没有找到名字包含 “{a.out}” 的输出设备，用 --list 查看。")
-        else:
+            out_name = device_name(out)
+        elif ds:
             print("\n【1】选择声音输出设备：")
             for i, s in enumerate(outs):
                 print(f"  [{i}] {device_name(s)}")
             last = next((i for i, s in enumerate(outs)
-                         if same_device(device_name(s), st.get("out"))), None)
-            out = outs[ask("编号", len(outs), last)]
+                         if same_device(device_name(s), out_name)), None)
+            out_name = device_name(outs[ask("编号", len(outs), last)])
         level = a.level
         if level is None:
-            print("\n【2】选择震动强度：")
+            print("\n选择震动强度：")
             for i, (name, *_) in enumerate(LEVELS):
                 print(f"  [{i}] {name}")
             level = ask("编号", len(LEVELS), st.get("level"))
 
-        out_name = device_name(out)
         save_settings(out=out_name, level=level)
-        if sc.default_speaker().id != ds.id:
+        name, strength, *_ = LEVELS[level]
+        if ds and sc.default_speaker().id != ds.id:
             print("\n⚠ 请在 Windows 声音设置里把默认输出设为 DualSense。")
-        print(f"\n{LEVELS[level][0]} -> {out_name}。运行中，Ctrl+C 退出。")
+        print(f"\n{name}。Ctrl+C 退出。")
+        shown = None
+
+        def show(text):
+            nonlocal shown
+            if text != shown:
+                shown = text
+                print(text)
+
         while True:
             try:
-                run(ds, out, level, a.gain)
-            except (RuntimeError, AssertionError) as e:  # 手柄/音箱断开或重新识别
-                print(f"\n音频设备断开（{e}），自动重连中……")
-                while True:
-                    time.sleep(2)
-                    ds, outs = list_devices()
-                    out = next((s for s in outs if same_device(device_name(s), out_name)), None)
-                    if ds and out:
-                        break
+                ds, outs = list_devices()
+                path = None if ds else bt.find()
+                out = next((s for s in outs if same_device(device_name(s), out_name)), None)
+                if ds and out:
+                    run(ds, out, level, a.gain, started=lambda: show(f"有线 -> {out_name}"))
+                    continue
+                if path and strength:
+                    run_bluetooth(path, level, started=lambda src: show(f"蓝牙 <- {src}"))
+                    continue
+                show("等待扬声器连接" if ds else
+                     "蓝牙下没有原生震动，请选 1~5 档" if path else "等待手柄连接")
+            except (RuntimeError, AssertionError, OSError) as e:  # 设备断开或重新识别
+                show(f"设备断开（{e}），自动重连中……")
+            time.sleep(2)
     except KeyboardInterrupt:
         print("\n已退出。")
 

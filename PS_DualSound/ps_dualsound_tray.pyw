@@ -238,21 +238,29 @@ class AudioWorker(threading.Thread):
                     if self.paused:
                         self._set("已暂停")
                         retry = None
-                    elif not self.out_name:
-                        self._set("请选择扬声器")
-                        retry = None
                     else:
                         ds, outs = bridge.list_devices()
+                        path = None if ds else bridge.bt.find()
+                        level = self.level
+                        name, strength, *_ = bridge.LEVELS[level]
                         out = next((s for s in outs if bridge.same_device(
                             bridge.device_name(s), self.out_name)), None)
-                        if not ds:
-                            self._set("等待手柄 USB 连接")
+                        if path and strength:
+                            bridge.run_bluetooth(
+                                path, level, self.changed.is_set,
+                                lambda src: self._set(f"蓝牙运行中 · {name}", True))
+                            continue
+                        elif path:
+                            self._set("蓝牙已连接 · 增强已关")
+                        elif not ds:
+                            self._set("等待手柄连接（USB 或蓝牙）")
+                        elif not self.out_name:
+                            self._set("请选择扬声器")
                         elif not out:
                             self._set("等待扬声器连接")
                         else:
-                            level = self.level
                             bridge.run(ds, out, level, self.gain, self.changed.is_set,
-                                       lambda: self._set(f"运行中 · {bridge.LEVELS[level][0]}", True))
+                                       lambda: self._set(f"有线运行中 · {name}", True))
                             continue
                 except Exception as e:
                     self._set(f"音频设备重连中（{str(e) or type(e).__name__}）")
@@ -320,9 +328,12 @@ class TrayApp:
         try:
             ds, outs = bridge.list_devices()
             self.devices = [bridge.device_name(s) for s in outs]
-            wrong_default = ds is not None and bridge.sc.default_speaker().id != ds.id
+            wireless = ds is None and bridge.bt.find() is not None
+            default = bridge.sc.default_speaker()
+            wrong_default = ds is not None and default.id != ds.id
+            following = bridge.device_name(default)
         except Exception:
-            self.devices, wrong_default = [], False
+            self.devices, wrong_default, wireless = [], False, False
 
         add(w.status, flags=MF_GRAYED)
         if wrong_default:
@@ -330,21 +341,26 @@ class TrayApp:
         separator()
         add("震动", flags=MF_GRAYED)
         for i, (name, *_) in enumerate(bridge.LEVELS):
-            add(name, CMD_LEVEL + i)
+            add("关闭增强（原生震动需有线）" if wireless and i == 0 else name, CMD_LEVEL + i)
         user32.CheckMenuRadioItem(menu, CMD_LEVEL, CMD_LEVEL + len(bridge.LEVELS) - 1,
                                   CMD_LEVEL + w.level, 0)
         separator()
-        add("扬声器", flags=MF_GRAYED)
-        selected = None
-        for i, name in enumerate(self.devices):
-            add(name, CMD_DEVICE + i)
-            if selected is None and bridge.same_device(name, w.out_name):
-                selected = i
-        if selected is not None:
-            user32.CheckMenuRadioItem(menu, CMD_DEVICE, CMD_DEVICE + len(self.devices) - 1,
-                                      CMD_DEVICE + selected, 0)
-        elif w.out_name:
-            add(f"{w.out_name}（未连接）", flags=MF_GRAYED | MF_CHECKED)
+        if wireless:  # 蓝牙时声音本来就在音箱里，不需要转发
+            self.devices = []
+            add("扬声器（跟随 Windows 输出）", flags=MF_GRAYED)
+            add(following, CMD_SOUND, MF_CHECKED)
+        else:
+            add("扬声器", flags=MF_GRAYED)
+            selected = None
+            for i, name in enumerate(self.devices):
+                add(name, CMD_DEVICE + i)
+                if selected is None and bridge.same_device(name, w.out_name):
+                    selected = i
+            if selected is not None:
+                user32.CheckMenuRadioItem(menu, CMD_DEVICE, CMD_DEVICE + len(self.devices) - 1,
+                                          CMD_DEVICE + selected, 0)
+            elif w.out_name:
+                add(f"{w.out_name}（未连接）", flags=MF_GRAYED | MF_CHECKED)
         separator()
         add("暂停", CMD_PAUSE, MF_CHECKED if w.paused else MF_STRING)
         add("开机自启", CMD_AUTOSTART, MF_CHECKED if autostart_enabled() else MF_STRING)

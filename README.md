@@ -8,7 +8,7 @@
 
 | 项目 Project | 用途 Purpose | 平台 Platform |
 |---|---|---|
-| [PS_DualSound](PS_DualSound/) | DualSense 震动留在手柄，游戏声音分到任意音箱<br>*Keep DualSense haptics on the pad, send game audio to any speaker* | Windows |
+| [PS_DualSound](PS_DualSound/) | DualSense 震动留在手柄，游戏声音分到任意音箱，支持有线和蓝牙<br>*Keep DualSense haptics on the pad, game audio on any speaker (USB & Bluetooth)* | Windows |
 
 ## 结构 Structure
 
