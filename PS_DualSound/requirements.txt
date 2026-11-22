@@ -1,0 +1,3 @@
+# SoundCard is pinned: ps_dualsound.py patches a leak in one of its internal methods
+SoundCard==0.4.6
+numpy>=1.24,<3

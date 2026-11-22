@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# PS_DualSound local state (contains device names)
+settings.json
+settings.tmp
+tray_error.log
